@@ -1,0 +1,128 @@
+local QBCore = exports['qb-core']:GetCoreObject()
+local lib = exports.ox_lib
+local shops = {}
+local currentPreview = { vehicle = nil, cam = nil }
+
+local function drawBlipForShop(shop)
+    if not shop.blip then return end
+    local blip = AddBlipForCoord(shop.coords.x, shop.coords.y, shop.coords.z)
+    SetBlipSprite(blip, shop.blip.sprite or Config.DefaultBlip.sprite)
+    SetBlipDisplay(blip, 4)
+    SetBlipScale(blip, shop.blip.scale or Config.DefaultBlip.scale)
+    SetBlipColour(blip, shop.blip.color or Config.DefaultBlip.color)
+    SetBlipAsShortRange(blip, true)
+    BeginTextCommandSetBlipName('STRING')
+    AddTextComponentSubstringPlayerName(shop.blip.text or Config.DefaultBlip.text)
+    EndTextCommandSetBlipName(blip)
+end
+
+local function loadShops()
+    lib.callback('vehicleshop:getShops', false, function(result)
+        if result and #result > 0 then
+            shops = {}
+            for _, s in ipairs(result) do
+                shops[s.id] = s
+                drawBlipForShop(s)
+            end
+        end
+    end)
+end
+
+RegisterNetEvent('vehicleshop:shopCreated', function(shop)
+    shops[shop.id] = shop
+    drawBlipForShop(shop)
+    lib.notify({ title = 'Vehicle Shop', description = 'New shop created: '..shop.name, type = 'success' })
+end)
+
+RegisterNetEvent('vehicleshop:shopDeleted', function(id)
+    shops[id] = nil
+    lib.notify({ title = 'Vehicle Shop', description = 'Shop removed', type = 'warning' })
+end)
+
+-- Open creator UI for admins (command + event)
+RegisterNetEvent('vehicleshop:openCreator', function()
+    local ped = PlayerPedId()
+    local pcoords = GetEntityCoords(ped)
+    local input = lib.inputDialog('Create Vehicle Shop', {{ type = 'input', label = 'Shop name', required = true }})
+    if not input then return end
+    local spawn = { x = pcoords.x + Config.SpawnOffset.x, y = pcoords.y + Config.SpawnOffset.y, z = pcoords.z + Config.SpawnOffset.z, heading = GetEntityHeading(ped) }
+    lib.callback('vehicleshop:createShop', false, function(success, res)
+        if success then
+            lib.notify({ title = 'Vehicle Shop', description = 'Shop created', type = 'success' })
+        else
+            lib.notify({ title = 'Vehicle Shop', description = 'Could not create shop: '..tostring(res), type = 'error' })
+        end
+    end, { name = input[1], coords = { x = pcoords.x, y = pcoords.y, z = pcoords.z }, spawn = spawn, blip = Config.DefaultBlip, data = { vehicles = Config.ExampleVehicles } })
+end)
+
+-- Draw markers and handle interactions
+CreateThread(function()
+    loadShops()
+    while true do
+        local wait = 1000
+        local ped = PlayerPedId()
+        local pcoords = GetEntityCoords(ped)
+        for id, shop in pairs(shops) do
+            local dist = #(pcoords - vector3(shop.coords.x, shop.coords.y, shop.coords.z))
+            if dist < 50.0 then
+                wait = 0
+                DrawMarker(2, shop.coords.x, shop.coords.y, shop.coords.z + 0.1, 0,0,0, 0,0,0, 1.2,1.2,0.2, 0, 155, 255, 100, false, false, 2, nil, nil, false)
+                if dist < 2.0 then
+                    lib.showTextUI('[E] - Open Vehicle Shop', { position = 'top-center' })
+                    if IsControlJustReleased(0, 38) then -- E
+                        local shopData = shop.data
+                        -- build menu
+                        local options = {}
+                        for i,v in ipairs(shopData.vehicles) do
+                            table.insert(options, { title = v.name..' - $'..v.price, description = v.model, onSelect = function()
+                                lib.alertDialog({ header = 'Confirm Purchase', content = ('Buy %s for $%s?'):format(v.name, v.price), centered = true, cancel = true }):next(function(confirmed)
+                                    if confirmed then
+                                        TriggerServerEvent('vehicleshop:buyVehicle', shop.id, v)
+                                    end
+                                end)
+                            end})
+                        end
+                        lib.registerContext({ id = 'vehicleshop_menu_'..id, title = shop.name, options = options })
+                        lib.showContext('vehicleshop_menu_'..id)
+                    end
+                else
+                    if lib.isTextUIOpen() then lib.hideTextUI() end
+                end
+            end
+        end
+
+        -- Admin creator: SHIFT + E opens creator
+        if IsControlJustReleased(0, 38) and IsControlPressed(0, 21) then
+            -- only for admins: trigger server event to open UI
+            TriggerServerEvent('vehicleshop:requestOpenCreator')
+        end
+        Wait(wait)
+    end
+end)
+
+-- Purchase success: spawn vehicle and give keys
+RegisterNetEvent('vehicleshop:purchaseSuccess', function(data)
+    lib.notify({ title = 'Vehicle Shop', description = 'Purchase successful. Plate: '..data.plate, type = 'success' })
+    local ped = PlayerPedId()
+    local coords = GetEntityCoords(ped)
+    lib.requestModel(data.model)
+    local veh = CreateVehicle(GetHashKey(data.model), coords.x + 2, coords.y + 2, coords.z, GetEntityHeading(ped), true, false)
+    SetVehicleNumberPlateText(veh, data.plate)
+    TaskWarpPedIntoVehicle(ped, veh, -1)
+    -- give keys via qb-vehiclekeys export if present
+    if exports['qb-vehiclekeys'] then
+        exports['qb-vehiclekeys']:SetVehicleOwner(GetVehicleNumberPlateText(veh))
+    end
+end)
+
+-- Listen to server opening creator for admins
+RegisterNetEvent('vehicleshop:openCreatorClient', function()
+    TriggerEvent('vehicleshop:openCreator')
+end)
+
+AddEventHandler('onClientResourceStop', function(res)
+    if res ~= GetCurrentResourceName() then return end
+    if currentPreview.cam then
+        DestroyCam(currentPreview.cam, false)
+    end
+end)
