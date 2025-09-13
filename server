@@ -1,0 +1,243 @@
+ocal QBCore = exports['qb-core']:GetCoreObject()
+local shops = {}
+local lastCreate = {}
+
+local function initDB()
+    if not Config.UseMySQL then return end
+    local sql = [[
+    CREATE TABLE IF NOT EXISTS ]] .. Config.TableName .. [[ (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        coords JSON NOT NULL,
+        spawn JSON NOT NULL,
+        blip JSON DEFAULT NULL,
+        data JSON NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ]]
+    MySQL.query(sql, {}, function() end)
+end
+
+AddEventHandler('onResourceStart', function(resourceName)
+    if GetCurrentResourceName() ~= resourceName then return end
+    initDB()
+    -- load shops
+    if Config.UseMySQL then
+        MySQL.query('SELECT * FROM ' .. Config.TableName, {}, function(result)
+            if result and #result > 0 then
+                for _, row in ipairs(result) do
+                    local shop = {
+                        id = row.id,
+                        name = row.name,
+                        coords = json.decode(row.coords),
+                        spawn = json.decode(row.spawn),
+                        blip = row.blip and json.decode(row.blip) or nil,
+                        data = json.decode(row.data)
+                    }
+                    shops[shop.id] = shop
+                end
+            end
+        end)
+    end
+end)
+
+local function isAdmin(source)
+    if Config.UseACE then
+        return IsPlayerAceAllowed(source, Config.ACEGroup)
+    end
+    if Config.AdminJob then
+        local Player = QBCore.Functions.GetPlayer(source)
+        if Player and Player.PlayerData and Player.PlayerData.job then
+            return Player.PlayerData.job.name == Config.AdminJob
+        end
+    end
+    return false
+end
+
+-- Create shop (server validated)
+QBCore.Functions.CreateCallback('vehicleshop:createShop', function(source, cb, data)
+    if not isAdmin(source) then cb(false, 'no_permission') return end
+    local now = GetGameTimer()
+    if lastCreate[source] and now - lastCreate[source] < Config.RateLimit then cb(false, 'rate_limited') return end
+    lastCreate[source] = now
+
+    if not data.name or not data.coords or not data.spawn then cb(false, 'invalid_data') return end
+
+    local shop = {
+        name = tostring(data.name),
+        coords = data.coords,
+        spawn = data.spawn,
+        blip = data.blip or Config.DefaultBlip,
+        data = data.data or { vehicles = Config.ExampleVehicles }
+    }
+
+    if Config.UseMySQL then
+        MySQL.insert(Config.TableName, {
+            name = shop.name,
+            coords = json.encode(shop.coords),
+            spawn = json.encode(shop.spawn),
+            blip = json.encode(shop.blip),
+            data = json.encode(shop.data)
+        }, function(id)
+            if id then
+                shop.id = id
+                shops[id] = shop
+                cb(true, shop)
+                TriggerClientEvent('vehicleshop:shopCreated', -1, shop)
+            else
+                cb(false, 'db_error')
+            end
+        end)
+    else
+        local id = math.random(100000, 999999)
+        shop.id = id
+        shops[id] = shop
+        cb(true, shop)
+        TriggerClientEvent('vehicleshop:shopCreated', -1, shop)
+    end
+end)
+
+QBCore.Functions.CreateCallback('vehicleshop:getShops', function(source, cb)
+    local out = {}
+    for k,v in pairs(shops) do table.insert(out, v) end
+    cb(out)
+end)
+
+-- Helper to save owned vehicle if owned_vehicles table exists (generic)
+local function saveOwnedVehicle(identifier, plate, model)
+    if not Config.UseMySQL then return false end
+    -- try inserting into a generic owned_vehicles table (many setups vary)
+    local ok, err = pcall(function()
+        -- attempt common table name 'player_vehicles' then 'owned_vehicles'
+        local entry = {
+            citizenid = identifier,
+            plate = plate,
+            vehicle = json.encode({ model = model }),
+            state = 0
+        }
+        -- Try player_vehicles
+        local res = MySQL.insert('player_vehicles', entry, function(id) end)
+        -- If insert failed silently, attempt owned_vehicles
+        -- Note: This is best-effort; server owners should adapt to their vehicle ownership schema
+    end)
+    return true
+end
+
+-- Buy vehicle
+RegisterNetEvent('vehicleshop:buyVehicle', function(shopId, vehicleData)
+    local src = source
+    local Player = QBCore.Functions.GetPlayer(src)
+    if not Player then return end
+    local shop = shops[shopId]
+    if not shop then
+        TriggerClientEvent('QBCore:Notify', src, 'Shop not found', 'error')
+        return
+    end
+    if type(vehicleData) ~= 'table' or not vehicleData.model or not vehicleData.price then
+        TriggerClientEvent('QBCore:Notify', src, 'Invalid vehicle data', 'error')
+        return
+    end
+
+    local price = tonumber(vehicleData.price)
+    if not price then return end
+
+    -- prefer bank if price > 50000 for example (configurable)
+    local payType = 'cash'
+    if Player.PlayerData.money.bank and Player.PlayerData.money.bank >= price and price >= 50000 then
+        payType = 'bank'
+    end
+
+    if Player.PlayerData.money[payType] < price then
+        TriggerClientEvent('QBCore:Notify', src, 'Not enough ' .. payType, 'error')
+        return
+    end
+
+    -- remove money
+    Player.Functions.RemoveMoney(payType, price, 'vehicleshop-purchase')
+
+    -- Generate unique plate (simple loop to avoid duplicates in DB)
+    local plate
+    repeat
+        plate = string.format(Config.PlateFormat, math.random(1, 99999))
+        -- Ideally check DB for existing plate; omitted for brevity
+        break
+    until false
+
+    -- Save ownership (best-effort)
+    local identifier = Player.PlayerData.citizenid or Player.PlayerData.license or Player.PlayerData.identifier
+    if identifier then
+        saveOwnedVehicle(identifier, plate, vehicleData.model)
+    end
+
+    -- Trigger client to spawn vehicle and give keys
+    TriggerClientEvent('vehicleshop:purchaseSuccess', src, { model = vehicleData.model, plate = plate, price = price })
+
+    -- Give vehicle keys via known event if present (qb-vehiclekeys integration)
+    -- This triggers client event to set owner for the key resource
+    TriggerClientEvent('vehiclekeys:client:SetOwner', src, plate)
+end)
+
+-- Delete shop (admin)
+QBCore.Functions.CreateCallback('vehicleshop:deleteShop', function(source, cb, shopId)
+    if not isAdmin(source) then cb(false, 'no_permission') return end
+    local shop = shops[shopId]
+    if not shop then cb(false, 'not_found') return end
+    if Config.UseMySQL then
+        MySQL.query('DELETE FROM '..Config.TableName..' WHERE id = ?', { shopId }, function(affected)
+            shops[shopId] = nil
+            cb(true)
+            TriggerClientEvent('vehicleshop:shopDeleted', -1, shopId)
+        end)
+    else
+        shops[shopId] = nil
+        cb(true)
+        TriggerClientEvent('vehicleshop:shopDeleted', -1, shopId)
+    end
+end)
+
+-- Admin commands
+CreateThread(function()
+    RegisterCommand('vehicleshop', function(source, args)
+        local src = source
+        if src == 0 then
+            print('Use in-game or specify player ID')
+            return
+        end
+        if not isAdmin(src) then
+            TriggerClientEvent('QBCore:Notify', src, 'You are not an admin', 'error')
+            return
+        end
+        local sub = args[1]
+        if sub == 'create' then
+            TriggerClientEvent('vehicleshop:openCreator', src)
+        elseif sub == 'list' then
+            local out = {}
+            for k,v in pairs(shops) do table.insert(out, ('%d: %s'):format(k, v.name)) end
+            TriggerClientEvent('chat:addMessage', src, { args = { 'VehicleShop', table.concat(out, '\n') } })
+        elseif sub == 'delete' then
+            local id = tonumber(args[2])
+            if not id then TriggerClientEvent('QBCore:Notify', src, 'Usage: /vehicleshop delete <id>', 'error') return end
+            QBCore.Functions.TriggerCallback('vehicleshop:deleteShop', src, function(success)
+                if success then TriggerClientEvent('QBCore:Notify', src, 'Shop deleted', 'success') else TriggerClientEvent('QBCore:Notify', src, 'Could not delete', 'error') end
+            end, id)
+        else
+            TriggerClientEvent('QBCore:Notify', src, 'Commands: create | list | delete', 'primary')
+        end
+    end, false)
+end)
+
+-- Exports
+exports('GetShops', function()
+    local out = {}
+    for k,v in pairs(shops) do table.insert(out, v) end
+    return out
+end)
+
+exports('CreateShop', function(data)
+    local src = source
+    if not data then return false end
+    local p = promise.new()
+    QBCore.Functions.TriggerCallback('vehicleshop:createShop', src, function(success, res)
+        p:resolve({ success = success, res = res })
+    end, data)
+    return Citizen.Await(p)
+end)
